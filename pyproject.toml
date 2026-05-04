@@ -1,0 +1,52 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fitapp-core"
+version = "0.1.0"
+description = "Shared health/fitness intelligence: AI food vision, barcode chain (OFF + USDA), macros, cycle phase, glucose curves, allergen alerts, audit primitives. Internal to ELH Empire."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Proprietary" }
+authors = [{ name = "ELH" }]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Operating System :: OS Independent",
+    "Private :: Do Not Upload",
+]
+dependencies = []  # stdlib-only by design — keeps consumers free of dependency hell
+
+[project.optional-dependencies]
+test = ["pytest>=7", "pytest-cov>=4"]
+dev  = ["mypy>=1.6", "ruff>=0.1", "pytest>=7", "pytest-cov>=4"]
+
+[project.urls]
+"Homepage" = "https://github.com/cougheebrohead/fitapp-core"
+"Repository" = "https://github.com/cougheebrohead/fitapp-core"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["fitapp_core*"]
+exclude = ["tests*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q --strict-markers"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "N"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+ignore_missing_imports = true
