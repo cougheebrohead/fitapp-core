@@ -29,6 +29,7 @@ from .cycle import cycle_phase
 from .glucose import glucose_excursion, time_in_range
 from .alerts import allergen_alerts, condition_flags
 from .audit import audit_event, AuditAction
+from .biomarkers import biomarker_anomalies, recovery_score
 from .exceptions import FitAppCoreError, ConfigError, ProviderError
 
 __all__ = [
@@ -49,6 +50,8 @@ __all__ = [
     "condition_flags",
     "audit_event",
     "AuditAction",
+    "biomarker_anomalies",
+    "recovery_score",
     "FitAppCoreError",
     "ConfigError",
     "ProviderError",
