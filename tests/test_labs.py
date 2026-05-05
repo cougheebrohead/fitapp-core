@@ -54,8 +54,41 @@ def test_missing_keys_safe():
     raw = '{"panel_name":"X","biomarkers":{"ldl":{}}}'
     out = L._parse_lab_json(raw)
     assert out["biomarkers"]["ldl"] == {
-        "value": None, "unit": None, "ref_low": None, "ref_high": None, "flag": "in_range"
+        "value": None, "unit": None, "ref_low": None, "ref_high": None,
+        "flag": "in_range", "direction": "up_bad",
     }
+
+
+def test_direction_up_good():
+    for key in ("hdl", "vitamin_d", "ferritin"):
+        assert L.biomarker_direction(key) == "up_good", key
+
+
+def test_direction_up_bad():
+    for key in ("hba1c", "ldl", "triglycerides"):
+        assert L.biomarker_direction(key) == "up_bad", key
+
+
+def test_direction_neutral():
+    for key in ("tsh", "sodium"):
+        assert L.biomarker_direction(key) == "neutral", key
+
+
+def test_direction_unknown_falls_back_to_up_bad():
+    assert L.biomarker_direction("totally_made_up_marker") == "up_bad"
+
+
+def test_direction_normalizes_input():
+    assert L.biomarker_direction("Vitamin D") == "up_good"
+    assert L.biomarker_direction("  HbA1c  ") == "up_bad"
+
+
+def test_parsed_biomarkers_carry_direction():
+    raw = '{"panel_name":"X","biomarkers":{"hdl":{"value":55,"unit":"mg/dL","flag":"in_range"},"ldl":{"value":110,"unit":"mg/dL","flag":"high"},"sodium":{"value":140,"unit":"mEq/L"}}}'
+    out = L._parse_lab_json(raw)
+    assert out["biomarkers"]["hdl"]["direction"] == "up_good"
+    assert out["biomarkers"]["ldl"]["direction"] == "up_bad"
+    assert out["biomarkers"]["sodium"]["direction"] == "neutral"
 
 
 def test_unparseable_returns_warnings():

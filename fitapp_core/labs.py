@@ -239,6 +239,73 @@ def _claude_scan(b64: str, media_type: str, api_key: str,
 _NUMERIC_RE = re.compile(r"-?\d+(?:\.\d+)?")
 
 
+# ─── biomarker direction map ─────────────────────────────────────────
+#
+# Per-biomarker clinical direction. "up_good" = rising values are
+# health-positive, "up_bad" = rising values are concerning, "neutral"
+# = context-dependent / no strong default. Used by trend-delta UIs to
+# color ↑/↓ correctly (e.g. HDL up = green, LDL up = red, sodium up =
+# dim/neutral). Keys are in normalized form (see _normalize_key).
+
+_UP_GOOD = {
+    "hdl_cholesterol", "hdl",
+    "vitamin_d", "vit_d",
+    "ferritin", "iron", "iron_saturation", "transferrin_saturation",
+    "t3", "free_t3", "total_t3",
+    "t4", "free_t4", "total_t4",
+    "total_testosterone", "testosterone_total",
+    "free_testosterone", "testosterone_free",
+    "b12", "vitamin_b12",
+    "magnesium",
+    "albumin",
+    "gfr", "egfr",
+}
+
+_UP_BAD = {
+    "hba1c", "a1c",
+    "fasting_glucose", "glucose",
+    "ldl_cholesterol", "ldl",
+    "total_cholesterol",
+    "triglycerides",
+    "crp", "hs_crp",
+    "alt", "ast", "ggt", "alkaline_phosphatase",
+    "creatinine", "bun", "uric_acid", "homocysteine",
+    "insulin", "fasting_insulin",
+    "fibrinogen", "lp_a", "lipoprotein_a", "apob", "apo_b",
+    "vldl", "esr",
+    "blood_pressure_systolic", "blood_pressure_diastolic", "sbp", "dbp",
+}
+
+_NEUTRAL = {
+    "tsh",
+    "sodium", "potassium", "chloride", "co2",
+    "calcium", "phosphorus",
+    "hemoglobin", "hematocrit",
+    "mcv", "mch", "mchc", "rdw",
+    "platelets", "wbc", "rbc",
+    "neutrophils", "lymphocytes", "monocytes", "eosinophils", "basophils",
+}
+
+BIOMARKER_DIRECTION: dict[str, str] = {
+    **{k: "up_good" for k in _UP_GOOD},
+    **{k: "up_bad"  for k in _UP_BAD},
+    **{k: "neutral" for k in _NEUTRAL},
+}
+
+
+def biomarker_direction(key: str) -> str:
+    """Return 'up_good' | 'up_bad' | 'neutral' for a biomarker key.
+
+    Unknown keys fall back to 'up_bad' — that's the safe default for
+    trend-color UIs because the most common biomarkers people watch
+    (glucose, lipids, inflammation, liver/kidney) are all up_bad. A
+    false up_bad on an unknown marker over-flags rather than under-flags,
+    which is the correct failure mode for clinical trend cues.
+    """
+    norm = _normalize_key(key) or ""
+    return BIOMARKER_DIRECTION.get(norm, "up_bad")
+
+
 def _parse_lab_json(text: str) -> dict[str, Any]:
     """Strip markdown fences + parse JSON. Sanitize biomarker shape."""
     if not text:
@@ -265,7 +332,7 @@ def _parse_lab_json(text: str) -> dict[str, Any]:
         norm_key = _normalize_key(key)
         if not norm_key:
             continue
-        biomarkers_out[norm_key] = _sanitize_biomarker(entry)
+        biomarkers_out[norm_key] = _sanitize_biomarker(entry, norm_key)
 
     return {
         "panel_name": _str_or_none(parsed.get("panel_name")),
@@ -336,14 +403,15 @@ def _to_number(v: Any) -> Optional[float]:
     return None
 
 
-def _sanitize_biomarker(entry: dict[str, Any]) -> dict[str, Any]:
+def _sanitize_biomarker(entry: dict[str, Any], key: str = "") -> dict[str, Any]:
     flag = entry.get("flag")
     if flag not in ("low", "in_range", "high"):
         flag = "in_range"
     return {
-        "value":    _to_number(entry.get("value")),
-        "unit":     _str_or_none(entry.get("unit")),
-        "ref_low":  _to_number(entry.get("ref_low")),
-        "ref_high": _to_number(entry.get("ref_high")),
-        "flag":     flag,
+        "value":     _to_number(entry.get("value")),
+        "unit":      _str_or_none(entry.get("unit")),
+        "ref_low":   _to_number(entry.get("ref_low")),
+        "ref_high":  _to_number(entry.get("ref_high")),
+        "flag":      flag,
+        "direction": biomarker_direction(key),
     }
