@@ -30,7 +30,6 @@ from .glucose import glucose_excursion, time_in_range
 from .alerts import allergen_alerts, condition_flags
 from .audit import audit_event, AuditAction
 from .exceptions import FitAppCoreError, ConfigError, ProviderError
-from .scraper import scrape_brand
 
 __all__ = [
     "__version__",
@@ -53,5 +52,4 @@ __all__ = [
     "FitAppCoreError",
     "ConfigError",
     "ProviderError",
-    "scrape_brand",
 ]
