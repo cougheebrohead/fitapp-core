@@ -32,6 +32,7 @@ from .audit import audit_event, AuditAction
 from .biomarkers import biomarker_anomalies, recovery_score
 from .labs import scan_lab, BIOMARKER_DIRECTION, biomarker_direction
 from .fhir import parse_fhir_lab
+from .menu import pick_menu_items
 from .exceptions import FitAppCoreError, ConfigError, ProviderError
 
 __all__ = [
@@ -58,6 +59,7 @@ __all__ = [
     "BIOMARKER_DIRECTION",
     "biomarker_direction",
     "parse_fhir_lab",
+    "pick_menu_items",
     "FitAppCoreError",
     "ConfigError",
     "ProviderError",
