@@ -33,7 +33,7 @@ from .biomarkers import biomarker_anomalies, recovery_score
 from .labs import scan_lab, BIOMARKER_DIRECTION, biomarker_direction
 from .fhir import parse_fhir_lab
 from .menu import pick_menu_items
-from .recipes import find_recipes
+from .recipes import find_recipes, suggest_meal_swaps
 from .exceptions import FitAppCoreError, ConfigError, ProviderError
 
 __all__ = [
@@ -62,6 +62,7 @@ __all__ = [
     "parse_fhir_lab",
     "pick_menu_items",
     "find_recipes",
+    "suggest_meal_swaps",
     "FitAppCoreError",
     "ConfigError",
     "ProviderError",
