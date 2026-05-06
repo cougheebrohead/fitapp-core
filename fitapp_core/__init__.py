@@ -31,6 +31,7 @@ from .alerts import allergen_alerts, condition_flags
 from .audit import audit_event, AuditAction
 from .biomarkers import biomarker_anomalies, recovery_score
 from .labs import scan_lab, BIOMARKER_DIRECTION, biomarker_direction
+from .fhir import parse_fhir_lab
 from .exceptions import FitAppCoreError, ConfigError, ProviderError
 
 __all__ = [
@@ -56,6 +57,7 @@ __all__ = [
     "scan_lab",
     "BIOMARKER_DIRECTION",
     "biomarker_direction",
+    "parse_fhir_lab",
     "FitAppCoreError",
     "ConfigError",
     "ProviderError",
