@@ -315,3 +315,17 @@ class TestLockoutStatus:
         )
         assert locked is False
         assert remaining == 0
+
+
+# ── regression: FitApp consumer's 16-byte salt + 32-byte dk base64 format ──
+
+def test_fitapp_consumer_base64_legacy_verifies():
+    """FitApp's auth.hash_password uses 16-byte salt + 32-byte dk
+    base64-encoded (NOT 32+32 hex). Regression for that layout."""
+    import base64, hashlib
+    salt = bytes(range(16))                                # 16 bytes
+    dk = hashlib.pbkdf2_hmac("sha256", b"hunter2", salt, 200_000)  # 32 bytes
+    blob_b64 = base64.b64encode(salt + dk).decode("ascii")
+    assert verify_password(blob_b64, "hunter2") is True
+    assert verify_password(blob_b64, "wrong") is False
+    assert needs_rehash(blob_b64) is True

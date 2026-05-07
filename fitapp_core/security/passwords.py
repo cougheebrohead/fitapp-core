@@ -35,12 +35,16 @@ except ImportError:
     _ARGON2_AVAILABLE = False
 
 
-# Legacy PBKDF2 params used by FitApp's existing hash_password() (raw 32-byte
-# salt + 32-byte dk concatenated, 200K iterations, sha256). We keep verify
-# compat for those.
+# Legacy PBKDF2 params for the raw-blob FitApp consumer format
+# (base64 of salt + dk, 200K iters, SHA-256). FitApp uses 16-byte salt +
+# 32-byte derived key (= 48 bytes total). An older variant used 32+32 (= 64).
+# verify_password tries the longer layout first, then the shorter.
 _FITAPP_PBKDF2_ITERS = 200_000
-_FITAPP_PBKDF2_SALT_LEN = 32
-_FITAPP_PBKDF2_DK_LEN = 32
+_FITAPP_LAYOUTS = (
+    # (salt_len, dk_len) — try 16+32 first (current FitApp), then 32+32 (older)
+    (16, 32),
+    (32, 32),
+)
 
 # coach + health use a self-describing format already; we parse it.
 
@@ -96,26 +100,39 @@ def verify_password(stored: str | bytes, plain: str) -> bool:
         except Exception:
             return False
 
-    # Legacy FitApp raw blob
+    # Legacy FitApp raw blob — try base64 (current) then hex (older variants)
+    candidates: list[bytes] = []
     if isinstance(stored, (bytes, bytearray, memoryview)):
-        b = bytes(stored)
+        candidates.append(bytes(stored))
     elif isinstance(stored, str):
-        # Some callers store the raw blob hex-encoded
+        s = stored.strip()
+        # Try base64 first — FitApp consumer's auth.hash_password() uses this
         try:
-            b = bytes.fromhex(stored)
+            import base64
+            decoded = base64.b64decode(s, validate=True)
+            candidates.append(decoded)
+        except Exception:
+            pass
+        # Try hex — older format variants
+        try:
+            candidates.append(bytes.fromhex(s))
         except ValueError:
-            return False
+            pass
     else:
         return False
 
-    if len(b) != _FITAPP_PBKDF2_SALT_LEN + _FITAPP_PBKDF2_DK_LEN:
-        return False
-    salt = b[:_FITAPP_PBKDF2_SALT_LEN]
-    expected_dk = b[_FITAPP_PBKDF2_SALT_LEN:]
-    actual_dk = hashlib.pbkdf2_hmac(
-        "sha256", plain.encode("utf-8"), salt, _FITAPP_PBKDF2_ITERS
-    )
-    return hmac.compare_digest(expected_dk, actual_dk)
+    for b in candidates:
+        for salt_len, dk_len in _FITAPP_LAYOUTS:
+            if len(b) != salt_len + dk_len:
+                continue
+            salt = b[:salt_len]
+            expected_dk = b[salt_len:]
+            actual_dk = hashlib.pbkdf2_hmac(
+                "sha256", plain.encode("utf-8"), salt, _FITAPP_PBKDF2_ITERS
+            )
+            if hmac.compare_digest(expected_dk, actual_dk):
+                return True
+    return False
 
 
 def needs_rehash(stored: str | bytes) -> bool:
