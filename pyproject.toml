@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "fitapp-core"
 version = "0.1.0"
-description = "Shared health/fitness intelligence: AI food vision, barcode chain (OFF + USDA), macros, cycle phase, glucose curves, allergen alerts, audit primitives. Internal to ELH Empire."
+description = "Shared health/fitness intelligence + security middleware: AI food vision, barcode chain (OFF + USDA), macros, cycle phase, glucose curves, allergen alerts, audit primitives, Argon2id passwords, CSRF, rate-limit, secure-headers, upload validation, output escape. Internal to ELH Empire."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "Proprietary" }
@@ -19,7 +19,12 @@ classifiers = [
     "Operating System :: OS Independent",
     "Private :: Do Not Upload",
 ]
-dependencies = []  # stdlib-only by design — keeps consumers free of dependency hell
+# argon2-cffi is the only non-stdlib dep — required for modern password hashing
+# in `fitapp_core.security.passwords`. Wheel ships pre-built on Linux + macOS so
+# no compile step is needed by consumers. Bounded to known-good major range.
+dependencies = [
+    "argon2-cffi>=23,<26",
+]
 
 [project.optional-dependencies]
 test = ["pytest>=7", "pytest-cov>=4"]
