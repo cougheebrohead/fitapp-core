@@ -149,8 +149,11 @@ def needs_rehash(stored: str | bytes) -> bool:
     Argon2id PHC strings return False (no rehash needed), unless argon2's
     internal `check_needs_rehash` says params are stale (e.g. we
     later raised time_cost).
+
+    Empty / None / falsey input returns False — nothing to rehash.
     """
-    if stored is None:
+    # Falsey input (None, '', b'', etc.): no hash to upgrade.
+    if not stored:
         return False
     if isinstance(stored, str) and stored.startswith("$argon2"):
         if not _ARGON2_AVAILABLE:
@@ -159,7 +162,7 @@ def needs_rehash(stored: str | bytes) -> bool:
             return _hasher.check_needs_rehash(stored)
         except Exception:
             return True
-    # Anything not Argon2 should be migrated.
+    # Anything not Argon2 (and not empty) should be migrated.
     return True
 
 

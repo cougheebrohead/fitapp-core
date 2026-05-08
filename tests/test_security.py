@@ -329,3 +329,14 @@ def test_fitapp_consumer_base64_legacy_verifies():
     assert verify_password(blob_b64, "hunter2") is True
     assert verify_password(blob_b64, "wrong") is False
     assert needs_rehash(blob_b64) is True
+
+
+def test_needs_rehash_empty_falsey_returns_false():
+    """Iron Dome regression: needs_rehash on falsey input must be
+    False, not True. An empty stored_hash isn't a legacy format —
+    it's just empty (e.g. OAuth-only user with no password set).
+    Returning True would trigger an infinite re-hash loop on every
+    successful login."""
+    assert needs_rehash('') is False
+    assert needs_rehash(None) is False
+    assert needs_rehash(b'') is False
