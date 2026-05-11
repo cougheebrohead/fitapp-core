@@ -35,6 +35,15 @@ from .fhir import parse_fhir_lab
 from .menu import pick_menu_items
 from .recipes import find_recipes, suggest_meal_swaps
 from .exceptions import FitAppCoreError, ConfigError, ProviderError
+from .pfas import (
+    PFAS_CATEGORY_KNOWLEDGE,
+    PFAS_GENERIC_GUIDANCE,
+    PFAS_KEYWORDS,
+    analyze_pfas_in_text,
+    pfas_category_lookup,
+    barcode_universal as pfas_barcode_universal,
+    compose_scan_response as pfas_scan_response,
+)
 
 __all__ = [
     "__version__",
@@ -66,4 +75,12 @@ __all__ = [
     "FitAppCoreError",
     "ConfigError",
     "ProviderError",
+    # PFAS / forever-chemicals scanner
+    "PFAS_CATEGORY_KNOWLEDGE",
+    "PFAS_GENERIC_GUIDANCE",
+    "PFAS_KEYWORDS",
+    "analyze_pfas_in_text",
+    "pfas_category_lookup",
+    "pfas_barcode_universal",
+    "pfas_scan_response",
 ]
