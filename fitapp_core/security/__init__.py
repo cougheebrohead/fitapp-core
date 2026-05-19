@@ -34,6 +34,14 @@ from .uploads import upload_validate, UploadError
 from .passwords import hash_password, verify_password, needs_rehash
 from .csrf import csrf_token, verify_csrf
 from .ratelimit import rate_limit_check, burst_detect
+from .sessions import (
+    new_session_token,
+    hash_token,
+    default_ttl_seconds,
+    bearer_from_authorization,
+    SessionCookie,
+    parse_cookie_header,
+)
 
 __all__ = [
     "secure_headers",
@@ -49,4 +57,10 @@ __all__ = [
     "verify_csrf",
     "rate_limit_check",
     "burst_detect",
+    "new_session_token",
+    "hash_token",
+    "default_ttl_seconds",
+    "bearer_from_authorization",
+    "SessionCookie",
+    "parse_cookie_header",
 ]
