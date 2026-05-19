@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "fitapp-core"
-version = "0.1.0"
+version = "0.6.0"
 description = "Shared health/fitness intelligence + security middleware: AI food vision, barcode chain (OFF + USDA), macros, cycle phase, glucose curves, allergen alerts, audit primitives, Argon2id passwords, CSRF, rate-limit, secure-headers, upload validation, output escape. Internal to ELH Empire."
 readme = "README.md"
 requires-python = ">=3.10"
