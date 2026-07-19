@@ -139,13 +139,17 @@ def test_find_recipes_falls_back_to_claude(monkeypatch):
     monkeypatch.setenv("CLAUDE_KEY", "c")
     def boom(*a, **k): raise RuntimeError("gemini down")
     captured = {"called": False}
-    def claude(prompt, key):
+    def claude(system_prompt, user_context, key):
         captured["called"] = True
+        captured["system_prompt"] = system_prompt
         return {"recipes": [], "warnings": []}
     with patch.object(R, "_gemini_recipes", side_effect=boom), \
          patch.object(R, "_claude_recipes", side_effect=claude):
         find_recipes(context={"remaining_calories": 500})
     assert captured["called"] is True
+    # Refactor invariant: static recipe-coach instructions live in
+    # system_prompt so Anthropic prompt caching gets ~90% off input.
+    assert "recipe coach" in captured["system_prompt"].lower()
 
 
 def test_find_recipes_no_keys_raises(monkeypatch):

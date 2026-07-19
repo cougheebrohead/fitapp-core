@@ -172,8 +172,10 @@ def test_pick_menu_items_falls_back_to_claude(monkeypatch):
     def fail_gemini(*a, **k): raise RuntimeError("gemini down")
 
     captured = {}
-    def fake_claude(b64, media_type, api_key, prompt):
+    def fake_claude(b64, media_type, api_key, system_prompt, ctx_block):
         captured["called"] = True
+        captured["system_prompt"] = system_prompt
+        captured["ctx_block"] = ctx_block
         return {"venue": "Claude-Stub", "picks": [], "avoid": [], "raw_text": "", "warnings": []}
 
     with patch.object(M, "_gemini_pick", side_effect=fail_gemini), \
@@ -182,6 +184,9 @@ def test_pick_menu_items_falls_back_to_claude(monkeypatch):
 
     assert captured.get("called") is True
     assert out["venue"] == "Claude-Stub"
+    # Refactor invariant: static instructions live in system_prompt,
+    # per-request user context lives separately (cache-friendly split).
+    assert "menu nutritionist" in captured["system_prompt"].lower()
 
 
 def test_pick_menu_items_no_keys_raises(monkeypatch):
@@ -200,7 +205,7 @@ def test_pick_menu_items_accepts_b64_string(monkeypatch):
     monkeypatch.setenv("CLAUDE_KEY", "c")
     monkeypatch.delenv("GEMINI_KEY", raising=False)
     captured = {}
-    def fake_claude(b64, media_type, api_key, prompt):
+    def fake_claude(b64, media_type, api_key, system_prompt, ctx_block):
         captured["b64"] = b64
         return {"venue": None, "picks": [], "avoid": [], "raw_text": "", "warnings": []}
     with patch.object(M, "_claude_pick", side_effect=fake_claude):

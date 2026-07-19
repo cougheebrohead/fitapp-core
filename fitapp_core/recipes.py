@@ -53,10 +53,24 @@ import urllib.parse
 import urllib.request
 from typing import Any, Optional
 
+from fitapp_core.ai import ClaudeClient, ClaudeConfig, SqliteResultCache
+
 
 _MAX_RESPONSE_BYTES = 200_000
 _MODEL_GEMINI = "gemini-2.0-flash"
 _MODEL_CLAUDE = "claude-sonnet-4-6"
+
+
+def _claude_client(api_key: str) -> ClaudeClient:
+    """Build a ClaudeClient with the shared result cache. Reads
+    FITAPP_CORE_CACHE_DB from env if set, else uses the default
+    (~/.fitapp-core/result-cache.db)."""
+    return ClaudeClient(
+        ClaudeConfig(api_key=api_key, default_model=_MODEL_CLAUDE, timeout=45),
+        cache=SqliteResultCache(
+            db_path=os.environ.get("FITAPP_CORE_CACHE_DB") or None
+        ),
+    )
 
 
 _PROMPT_HEAD = """You are a personal-nutrition recipe coach. Suggest 3-5
@@ -137,9 +151,14 @@ def find_recipes(
         ctx_lines.append("  " + str(block).replace("\n", " "))
     ctx_block = "\n".join(ctx_lines)
 
-    text_prompt = _PROMPT_HEAD + "\n\n" + ctx_block
+    # Static instructions in `system` (cache-friendly), dynamic user
+    # context stays outside. Language directive prepended to system so
+    # the per-language cache entry stays warm on repeat calls.
+    system_prompt = _PROMPT_HEAD
     if lang and lang != "en":
-        text_prompt = f"Respond entirely in {lang}.\n\n" + text_prompt
+        system_prompt = f"Respond entirely in {lang}.\n\n" + system_prompt
+    # Gemini has no cache_control; keep its combined-string interface.
+    gemini_prompt = system_prompt + "\n\n" + ctx_block
 
     gem_key = (os.environ.get("GEMINI_KEY") or "").strip().strip('"').strip("'")
     claude_key = (
@@ -152,12 +171,12 @@ def find_recipes(
     last_err: Optional[Exception] = None
     if gem_key:
         try:
-            return _gemini_recipes(text_prompt, gem_key)
+            return _gemini_recipes(gemini_prompt, gem_key)
         except Exception as e:
             last_err = e
     if claude_key:
         try:
-            return _claude_recipes(text_prompt, claude_key)
+            return _claude_recipes(system_prompt, ctx_block, claude_key)
         except Exception as e:
             last_err = e
     raise RuntimeError(f"find_recipes failed: {last_err}")
@@ -187,25 +206,17 @@ def _gemini_recipes(prompt: str, api_key: str) -> dict[str, Any]:
     return _parse_recipes(text)
 
 
-def _claude_recipes(prompt: str, api_key: str) -> dict[str, Any]:
-    body = {
-        "model": _MODEL_CLAUDE,
-        "max_tokens": 3000,
-        "messages": [{"role": "user", "content": prompt}],
-    }
-    req = urllib.request.Request(
-        "https://api.anthropic.com/v1/messages",
-        data=json.dumps(body).encode(),
-        headers={"Content-Type": "application/json",
-                 "x-api-key": api_key,
-                 "anthropic-version": "2023-06-01"},
-        method="POST",
+def _claude_recipes(system_prompt: str, user_context: str,
+                     api_key: str) -> dict[str, Any]:
+    out = _claude_client(api_key).messages(
+        system=system_prompt,
+        user=user_context,
+        max_tokens=3000,
+        temperature=0.4,
     )
-    with urllib.request.urlopen(req, timeout=45) as r:
-        raw = r.read(_MAX_RESPONSE_BYTES + 1)
-    result = json.loads(raw)
-    text = (result.get("content", [{}])[0] or {}).get("text", "")
-    return _parse_recipes(text)
+    if out.get("error"):
+        raise RuntimeError(out["error"])
+    return _parse_recipes(out.get("text", ""))
 
 
 # ─── parsing ──────────────────────────────────────────────────────────
@@ -350,9 +361,12 @@ def suggest_meal_swaps(
         ctx_lines.append("  " + str(block).replace("\n", " "))
     ctx_block = "\n".join(ctx_lines)
 
-    text_prompt = _SWAP_PROMPT + "\n\n" + ctx_block
+    # Static swap-rules in `system` (cache-friendly), dynamic per-user
+    # context stays outside.
+    system_prompt = _SWAP_PROMPT
     if lang and lang != "en":
-        text_prompt = f"Respond entirely in {lang}.\n\n" + text_prompt
+        system_prompt = f"Respond entirely in {lang}.\n\n" + system_prompt
+    gemini_prompt = system_prompt + "\n\n" + ctx_block
 
     gem_key = (os.environ.get("GEMINI_KEY") or "").strip().strip('"').strip("'")
     claude_key = (
@@ -365,12 +379,12 @@ def suggest_meal_swaps(
     last_err: Optional[Exception] = None
     if gem_key:
         try:
-            return _swaps_from_gemini(text_prompt, gem_key)
+            return _swaps_from_gemini(gemini_prompt, gem_key)
         except Exception as e:
             last_err = e
     if claude_key:
         try:
-            return _swaps_from_claude(text_prompt, claude_key)
+            return _swaps_from_claude(system_prompt, ctx_block, claude_key)
         except Exception as e:
             last_err = e
     raise RuntimeError(f"suggest_meal_swaps failed: {last_err}")
@@ -397,25 +411,17 @@ def _swaps_from_gemini(prompt: str, api_key: str) -> dict[str, Any]:
     return _parse_swaps(text)
 
 
-def _swaps_from_claude(prompt: str, api_key: str) -> dict[str, Any]:
-    body = {
-        "model": _MODEL_CLAUDE,
-        "max_tokens": 1500,
-        "messages": [{"role": "user", "content": prompt}],
-    }
-    req = urllib.request.Request(
-        "https://api.anthropic.com/v1/messages",
-        data=json.dumps(body).encode(),
-        headers={"Content-Type": "application/json",
-                 "x-api-key": api_key,
-                 "anthropic-version": "2023-06-01"},
-        method="POST",
+def _swaps_from_claude(system_prompt: str, user_context: str,
+                        api_key: str) -> dict[str, Any]:
+    out = _claude_client(api_key).messages(
+        system=system_prompt,
+        user=user_context,
+        max_tokens=1500,
+        temperature=0.4,
     )
-    with urllib.request.urlopen(req, timeout=45) as r:
-        raw = r.read(_MAX_RESPONSE_BYTES + 1)
-    result = json.loads(raw)
-    text = (result.get("content", [{}])[0] or {}).get("text", "")
-    return _parse_swaps(text)
+    if out.get("error"):
+        raise RuntimeError(out["error"])
+    return _parse_swaps(out.get("text", ""))
 
 
 def _parse_swaps(text: str) -> dict[str, Any]:

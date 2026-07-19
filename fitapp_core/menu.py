@@ -152,9 +152,12 @@ def pick_menu_items(
         ctx_lines.append(f"  Venue (hint): {ctx['venue_hint']}")
     ctx_block = "\n".join(ctx_lines)
 
-    text_prompt = _PROMPT_HEAD + "\n\n" + ctx_block
+    # Static instructions go to `system` (cache-friendly). Dynamic user
+    # context stays in `ctx_block` and is sent alongside the image.
+    system_prompt = _PROMPT_HEAD
     if lang and lang != "en":
-        text_prompt = f"Respond entirely in {lang}.\n\n" + text_prompt
+        system_prompt = f"Respond entirely in {lang}.\n\n" + system_prompt
+    gemini_prompt = system_prompt + "\n\n" + ctx_block  # Gemini has no cache_control
 
     gem_key = (os.environ.get("GEMINI_KEY") or "").strip().strip('"').strip("'")
     claude_key = (
@@ -167,12 +170,13 @@ def pick_menu_items(
     last_err: Optional[Exception] = None
     if gem_key:
         try:
-            return _gemini_pick(b64, media_type, gem_key, text_prompt)
+            return _gemini_pick(b64, media_type, gem_key, gemini_prompt)
         except Exception as e:
             last_err = e
     if claude_key:
         try:
-            return _claude_pick(b64, media_type, claude_key, text_prompt)
+            return _claude_pick(b64, media_type, claude_key,
+                                 system_prompt, ctx_block)
         except Exception as e:
             last_err = e
     raise RuntimeError(f"pick_menu_items failed: {last_err}")
@@ -209,33 +213,31 @@ def _gemini_pick(b64: str, media_type: str, api_key: str, prompt: str) -> dict[s
     return _parse_picks(text)
 
 
-def _claude_pick(b64: str, media_type: str, api_key: str, prompt: str) -> dict[str, Any]:
-    body = {
-        "model": "claude-sonnet-4-6",
-        "max_tokens": 2400,
-        "messages": [{
-            "role": "user",
-            "content": [
-                {"type": "image", "source": {"type": "base64",
-                                             "media_type": media_type,
-                                             "data": b64}},
-                {"type": "text", "text": prompt},
-            ],
-        }],
-    }
-    req = urllib.request.Request(
-        "https://api.anthropic.com/v1/messages",
-        data=json.dumps(body).encode(),
-        headers={"Content-Type": "application/json",
-                 "x-api-key": api_key,
-                 "anthropic-version": "2023-06-01"},
-        method="POST",
+def _claude_pick(b64: str, media_type: str, api_key: str,
+                  system_prompt: str, ctx_block: str) -> dict[str, Any]:
+    # Static menu-picker instructions in `system` (cache-friendly).
+    # Image + per-request user context stay in the user message.
+    # use_result_cache=False — every menu image is unique, so cache
+    # hit rate is ~0 and hashing big base64 blobs is wasted CPU.
+    from fitapp_core.ai import ClaudeClient, ClaudeConfig
+    client = ClaudeClient(ClaudeConfig(
+        api_key=api_key, default_model="claude-sonnet-4-6", timeout=45,
+    ))
+    out = client.messages(
+        system=system_prompt,
+        user=[
+            {"type": "image", "source": {"type": "base64",
+                                          "media_type": media_type,
+                                          "data": b64}},
+            {"type": "text", "text": ctx_block},
+        ],
+        max_tokens=2400,
+        temperature=0.1,
+        use_result_cache=False,
     )
-    with urllib.request.urlopen(req, timeout=45) as r:
-        raw = r.read(_MAX_RESPONSE_BYTES + 1)
-    result = json.loads(raw)
-    text = (result.get("content", [{}])[0] or {}).get("text", "")
-    return _parse_picks(text)
+    if out.get("error"):
+        raise RuntimeError(out["error"])
+    return _parse_picks(out.get("text", ""))
 
 
 # ─── parsing ──────────────────────────────────────────────────────────

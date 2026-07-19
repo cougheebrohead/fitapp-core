@@ -200,37 +200,32 @@ def _gemini_scan(b64: str, media_type: str, api_key: str,
 
 def _claude_scan(b64: str, media_type: str, api_key: str,
                  lang: Optional[str] = None) -> dict[str, Any]:
-    text_prompt = _PROMPT
+    # Static lab-parser instructions in `system` (cache-friendly). Every
+    # scan reads the same _PROMPT; ~90% off input tokens after first call.
+    # Language directive stays in system so per-language cache remains warm.
+    system_prompt = _PROMPT
     if lang:
-        text_prompt = f"Output language hint: {lang}.\n\n" + text_prompt
-    body = {
-        "model": "claude-sonnet-4-6",
-        "max_tokens": 4096,
-        "messages": [{
-            "role": "user",
-            "content": [
-                {"type": "image", "source": {"type": "base64",
-                                             "media_type": media_type,
-                                             "data": b64}},
-                {"type": "text", "text": text_prompt},
-            ],
-        }],
-    }
-    req = urllib.request.Request(
-        "https://api.anthropic.com/v1/messages",
-        data=json.dumps(body).encode(),
-        headers={
-            "Content-Type": "application/json",
-            "x-api-key": api_key,
-            "anthropic-version": "2023-06-01",
-        },
-        method="POST",
+        system_prompt = f"Output language hint: {lang}.\n\n" + system_prompt
+
+    from fitapp_core.ai import ClaudeClient, ClaudeConfig
+    client = ClaudeClient(ClaudeConfig(
+        api_key=api_key, default_model="claude-sonnet-4-6", timeout=45,
+    ))
+    out = client.messages(
+        system=system_prompt,
+        user=[
+            {"type": "image", "source": {"type": "base64",
+                                          "media_type": media_type,
+                                          "data": b64}},
+            # No trailing text needed; system carries the whole spec.
+        ],
+        max_tokens=4096,
+        temperature=0.1,
+        use_result_cache=False,  # unique image per scan; caching wastes CPU
     )
-    with urllib.request.urlopen(req, timeout=45) as r:
-        raw = r.read(_MAX_RESPONSE_BYTES + 1)
-    result = json.loads(raw)
-    text = (result.get("content", [{}])[0] or {}).get("text", "")
-    return _parse_lab_json(text)
+    if out.get("error"):
+        raise RuntimeError(out["error"])
+    return _parse_lab_json(out.get("text", ""))
 
 
 # ─── parsing helpers ──────────────────────────────────────────────────

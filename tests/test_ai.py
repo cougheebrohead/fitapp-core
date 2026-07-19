@@ -11,13 +11,23 @@ Goals:
     record only the primary, exceptions short-circuit to next provider.
 """
 
+import io
+import json
+import os
+import time
+from unittest.mock import patch
+
 from fitapp_core.ai import (
     BarbaraClient,
     BarbaraConfig,
     CallCounters,
+    ClaudeClient,
+    ClaudeConfig,
+    DEFAULT_CLAUDE_MODEL,
     DEFAULT_QUALITY_THRESHOLD,
     FallbackChain,
     REFUSAL_RE,
+    SqliteResultCache,
     output_ok,
     output_quality,
 )
@@ -395,3 +405,258 @@ def test_client_build_messages_caps_content_at_6000_chars():
     # Both history user content and final user content trimmed to 6000.
     assert len(msgs[0]["content"]) == 6000
     assert len(msgs[1]["content"]) == 6000
+
+
+# ─── SqliteResultCache ───────────────────────────────────────────────
+
+def _tmp_cache(tmp_path):
+    return SqliteResultCache(db_path=str(tmp_path / "cache.db"))
+
+
+def test_cache_get_miss_returns_none(tmp_path):
+    cache = _tmp_cache(tmp_path)
+    assert cache.get("no-such-key") is None
+
+
+def test_cache_set_then_get_roundtrip(tmp_path):
+    cache = _tmp_cache(tmp_path)
+    key = SqliteResultCache.make_key("claude-sonnet-4-6", "SYS", "USR")
+    cache.set(key, {"text": "hello", "tokens_in": 42}, ttl_s=60)
+    got = cache.get(key)
+    assert got == {"text": "hello", "tokens_in": 42}
+
+
+def test_cache_ttl_expiry(tmp_path):
+    cache = _tmp_cache(tmp_path)
+    key = SqliteResultCache.make_key("m", "s", "u")
+    cache.set(key, {"text": "hi"}, ttl_s=-1)  # already expired
+    assert cache.get(key) is None
+
+
+def test_cache_gc_removes_expired(tmp_path):
+    cache = _tmp_cache(tmp_path)
+    live = SqliteResultCache.make_key("m", "s", "live")
+    dead = SqliteResultCache.make_key("m", "s", "dead")
+    cache.set(live, {"text": "l"}, ttl_s=3600)
+    cache.set(dead, {"text": "d"}, ttl_s=-10)
+    removed = cache.gc()
+    assert removed == 1
+    assert cache.get(live) == {"text": "l"}
+    assert cache.get(dead) is None
+
+
+def test_cache_key_deterministic_and_order_stable(tmp_path):
+    # Same inputs → same key. Even with dict user content in different
+    # insertion orders, the sort_keys=True stable dumps guarantees a
+    # stable hash.
+    k1 = SqliteResultCache.make_key(
+        "m", "SYS", {"b": 2, "a": 1}, extra={"t": 0.1, "m": 100})
+    k2 = SqliteResultCache.make_key(
+        "m", "SYS", {"a": 1, "b": 2}, extra={"m": 100, "t": 0.1})
+    assert k1 == k2
+
+
+def test_cache_key_different_when_inputs_differ(tmp_path):
+    k1 = SqliteResultCache.make_key("m", "SYS", "user A")
+    k2 = SqliteResultCache.make_key("m", "SYS", "user B")
+    assert k1 != k2
+
+
+# ─── ClaudeClient — no-network path ──────────────────────────────────
+
+def test_claude_no_api_key_returns_error_shape():
+    client = ClaudeClient(ClaudeConfig(api_key=""))
+    out = client.messages("sys", "user")
+    assert out == {"error": "no api key", "text": ""}
+
+
+def test_claude_no_api_key_records_failure_when_counters_wired():
+    counters = CallCounters()
+    client = ClaudeClient(ClaudeConfig(api_key=""), counters=counters)
+    client.messages("sys", "user")
+    assert counters.calls == 1
+    assert counters.failures == 1
+
+
+# ─── ClaudeClient — mocked network ────────────────────────────────────
+
+class _FakeResp:
+    def __init__(self, body: bytes):
+        self._body = body
+    def read(self):
+        return self._body
+    def __enter__(self):
+        return self
+    def __exit__(self, *a):
+        return False
+
+
+def _ok_response_bytes(text: str = "hi", model: str = "claude-sonnet-4-6",
+                       tokens_in: int = 100, tokens_out: int = 20,
+                       cache_read: int = 0, cache_creation: int = 0) -> bytes:
+    return json.dumps({
+        "id": "msg_abc",
+        "model": model,
+        "content": [{"type": "text", "text": text}],
+        "stop_reason": "end_turn",
+        "usage": {
+            "input_tokens":  tokens_in,
+            "output_tokens": tokens_out,
+            "cache_read_input_tokens":     cache_read,
+            "cache_creation_input_tokens": cache_creation,
+        },
+    }).encode()
+
+
+def test_claude_messages_returns_normalized_shape():
+    client = ClaudeClient(ClaudeConfig(api_key="sk-test"))
+    fake = _FakeResp(_ok_response_bytes(text="answer"))
+    with patch("urllib.request.urlopen", return_value=fake):
+        out = client.messages("SYS", "hello")
+    assert out["text"] == "answer"
+    assert out["model"] == "claude-sonnet-4-6"
+    assert out["tokens_in"] == 100
+    assert out["tokens_out"] == 20
+    assert out["cached"] is False
+
+
+def test_claude_messages_wraps_system_with_cache_control_by_default():
+    # Intercept the Request object built to assert body shape.
+    captured: dict = {}
+
+    def fake_urlopen(req, timeout=None, context=None):
+        captured["headers"] = dict(req.headers)
+        captured["body"] = json.loads(req.data.decode())
+        return _FakeResp(_ok_response_bytes())
+
+    client = ClaudeClient(ClaudeConfig(api_key="sk-test"))
+    with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+        client.messages("big static prompt", "small dynamic user")
+
+    body = captured["body"]
+    assert body["system"] == [{
+        "type": "text", "text": "big static prompt",
+        "cache_control": {"type": "ephemeral"},
+    }]
+    assert body["messages"] == [{"role": "user",
+                                  "content": [{"type": "text",
+                                                "text": "small dynamic user"}]}]
+    # Anthropic version + key headers present. (urllib.Request lowercases
+    # header keys internally.)
+    assert captured["headers"]["X-api-key"] == "sk-test"
+    assert captured["headers"]["Anthropic-version"] == "2023-06-01"
+
+
+def test_claude_messages_can_disable_cache():
+    captured: dict = {}
+    def fake_urlopen(req, timeout=None, context=None):
+        captured["body"] = json.loads(req.data.decode())
+        return _FakeResp(_ok_response_bytes())
+    client = ClaudeClient(ClaudeConfig(api_key="sk-test"))
+    with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+        client.messages("SYS", "USR", cache_system=False)
+    sys_blocks = captured["body"]["system"]
+    assert sys_blocks == [{"type": "text", "text": "SYS"}]
+    assert "cache_control" not in sys_blocks[0]
+
+
+def test_claude_messages_accepts_content_blocks_for_vision():
+    # User is a list of content blocks (image + text) instead of a str.
+    captured: dict = {}
+    def fake_urlopen(req, timeout=None, context=None):
+        captured["body"] = json.loads(req.data.decode())
+        return _FakeResp(_ok_response_bytes())
+    user_blocks = [
+        {"type": "image", "source": {"type": "base64",
+                                      "media_type": "image/jpeg",
+                                      "data": "AAAA"}},
+        {"type": "text", "text": "what's in this image?"},
+    ]
+    client = ClaudeClient(ClaudeConfig(api_key="sk-test"))
+    with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+        client.messages("SYS", user_blocks)
+    assert captured["body"]["messages"][0]["content"] == user_blocks
+
+
+def test_claude_messages_reads_cache_hit_and_skips_network(tmp_path):
+    cache = _tmp_cache(tmp_path)
+    client = ClaudeClient(ClaudeConfig(api_key="sk-test"), cache=cache)
+
+    key = SqliteResultCache.make_key(
+        DEFAULT_CLAUDE_MODEL, "SYS", "USR",
+        extra={"max_tokens": 1024, "temperature": 0.1, "stop_sequences": []},
+    )
+    cache.set(key, {"text": "pre-baked", "model": "x", "tokens_in": 1,
+                    "tokens_out": 1, "cache_read_input_tokens": 0,
+                    "cache_creation_input_tokens": 0, "stop_reason": "end_turn",
+                    "cached": False},
+              ttl_s=60)
+
+    with patch("urllib.request.urlopen",
+               side_effect=AssertionError("network should not be called")):
+        out = client.messages("SYS", "USR")
+
+    assert out["text"] == "pre-baked"
+    assert out["cached"] is True
+
+
+def test_claude_messages_writes_to_cache_on_success(tmp_path):
+    cache = _tmp_cache(tmp_path)
+    client = ClaudeClient(ClaudeConfig(api_key="sk-test"), cache=cache)
+    with patch("urllib.request.urlopen",
+               return_value=_FakeResp(_ok_response_bytes(text="fresh"))):
+        client.messages("SYS", "USR")
+    # Second call must hit the cache — assert by making urlopen raise.
+    with patch("urllib.request.urlopen",
+               side_effect=AssertionError("cached, should not call")):
+        out = client.messages("SYS", "USR")
+    assert out["text"] == "fresh"
+    assert out["cached"] is True
+
+
+def test_claude_messages_http_error_returns_error_shape():
+    import urllib.error as ue
+    def raise_http(*_a, **_kw):
+        raise ue.HTTPError(url="", code=529, msg="overloaded",
+                            hdrs=None, fp=io.BytesIO(b"overloaded"))
+    client = ClaudeClient(ClaudeConfig(api_key="sk-test"))
+    with patch("urllib.request.urlopen", side_effect=raise_http):
+        out = client.messages("SYS", "USR")
+    assert "error" in out and "529" in out["error"]
+    assert out["text"] == ""
+
+
+def test_claude_batch_create_requires_api_key():
+    client = ClaudeClient(ClaudeConfig(api_key=""))
+    out = client.batch_create([{"custom_id": "x", "params": {"user": "u"}}])
+    assert out == {"error": "no api key"}
+
+
+def test_claude_batch_create_empty_request_returns_error():
+    client = ClaudeClient(ClaudeConfig(api_key="sk-test"))
+    out = client.batch_create([])
+    assert out == {"error": "empty batch"}
+
+
+def test_claude_batch_create_wraps_system_with_cache_control():
+    captured: dict = {}
+    def fake_urlopen(req, timeout=None, context=None):
+        captured["body"] = json.loads(req.data.decode())
+        captured["headers"] = dict(req.headers)
+        return _FakeResp(json.dumps({"id": "batch_abc",
+                                     "processing_status": "in_progress"}).encode())
+    client = ClaudeClient(ClaudeConfig(api_key="sk-test"))
+    with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+        client.batch_create([{
+            "custom_id": "row-1",
+            "params": {"system": "SYS", "user": "USR", "max_tokens": 500},
+        }])
+    body = captured["body"]
+    assert body["requests"][0]["custom_id"] == "row-1"
+    inner = body["requests"][0]["params"]
+    assert inner["system"] == [{"type": "text", "text": "SYS",
+                                 "cache_control": {"type": "ephemeral"}}]
+    assert inner["max_tokens"] == 500
+    # Batch API is a beta — header must be present.
+    assert captured["headers"].get("Anthropic-beta") == \
+        "message-batches-2024-09-24"

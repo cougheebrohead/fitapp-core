@@ -23,15 +23,20 @@ Design rules:
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
+import os
 import re
+import sqlite3
 import ssl
 import sys
+import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
-from typing import Any, Callable, Iterator, Optional
+from typing import Any, Callable, Iterator, Optional, Union
 
 # SSL context with a certifi-CA-bundle fallback for hosts whose system
 # trust store is empty (common on macOS framework Pythons + freshly-
@@ -578,6 +583,494 @@ class FallbackChain:
         return last_name, last_result
 
 
+# ─── Claude client + result cache + batch API ────────────────────────
+#
+# ClaudeClient is a stdlib-only Anthropic wrapper that structures every
+# call for MAXIMUM prompt-cache hit rate. The big static instruction
+# blob goes into `system` with `cache_control: ephemeral`, so repeat
+# calls with the same instructions pay ~10% of the input-token price.
+#
+# SqliteResultCache is a SHA-keyed answer cache (default 24h TTL) that
+# short-circuits repeated identical requests entirely — zero API cost
+# on any duplicate.
+#
+# ClaudeBatch wraps /v1/messages/batches for 50%-off async workloads
+# (weekly reports, daily briefings, ingest pipelines).
+#
+# All three are optional and composable: caller creates whichever they
+# need, wires the cache into the client, and calls .messages().
+
+
+DEFAULT_CLAUDE_MODEL = "claude-sonnet-4-6"
+
+
+@dataclass
+class ClaudeConfig:
+    """Per-host configuration for a ClaudeClient instance.
+
+    `api_key` MUST be injected by the host (env var, secret manager,
+    etc.). An empty key returns {"error": "no api key", "text": ""}
+    from every call — the FallbackChain then rolls to the next provider.
+    """
+
+    api_key: str = ""
+    base_url: str = "https://api.anthropic.com"
+    api_version: str = "2023-06-01"
+    default_model: str = DEFAULT_CLAUDE_MODEL
+    timeout: int = 60
+    user_agent: str = "fitapp-core-claude/1.0"
+
+    # When True (default), the `system` prompt on every .messages() call
+    # is wrapped with cache_control: ephemeral. Cached input tokens are
+    # billed at ~10% of standard input rate. Anthropic requires at
+    # least 1024 tokens (Sonnet) / 2048 tokens (Haiku) in a cache block
+    # or the cache_control is silently ignored — small prompts don't
+    # break, they just don't cache.
+    cache_system_by_default: bool = True
+
+
+class SqliteResultCache:
+    """SHA-keyed answer cache backed by SQLite.
+
+    Wraps `(model, system, user, opts) -> response`. Default 24h TTL.
+    Thread-safe via a module-level RLock (SQLite in WAL mode is fine
+    for concurrent reads, but we serialize writes to avoid rare
+    "database is locked" storms in high-fanout batch jobs).
+
+    Cache misses are cheap (one indexed lookup); hits skip the API
+    call entirely. `gc()` reaps expired rows and returns the count.
+
+    Design notes:
+    - stdlib only (sqlite3, hashlib, json, time)
+    - `.db` file lives wherever the caller decides (default:
+      `~/.fitapp-core/result-cache.db`). Same file across processes
+      = shared cache. Not appropriate for multi-host deploys (use
+      Redis at that scale) but perfect for a single Render service.
+    - JSON is the storage format; anything json-serializable can be
+      cached. The client stores {'text', 'model', 'tokens_in', ...}
+      shaped dicts.
+    """
+
+    _lock = threading.RLock()
+
+    def __init__(self, db_path: Optional[str] = None):
+        if db_path is None:
+            base = os.path.expanduser("~/.fitapp-core")
+            os.makedirs(base, exist_ok=True)
+            db_path = os.path.join(base, "result-cache.db")
+        self.db_path = db_path
+        self._init()
+
+    def _init(self) -> None:
+        with self._lock, sqlite3.connect(self.db_path) as con:
+            con.execute("PRAGMA journal_mode=WAL")
+            con.execute(
+                "CREATE TABLE IF NOT EXISTS cache ("
+                "key TEXT PRIMARY KEY, "
+                "value TEXT NOT NULL, "
+                "expires_at INTEGER NOT NULL, "
+                "created_at INTEGER NOT NULL)"
+            )
+            con.execute(
+                "CREATE INDEX IF NOT EXISTS idx_cache_expires "
+                "ON cache(expires_at)"
+            )
+            con.commit()
+
+    @staticmethod
+    def make_key(model: str, system: Any, user: Any,
+                 extra: Optional[dict] = None) -> str:
+        """Deterministic SHA-256 key. `extra` is any additional
+        cache-affecting knob (temperature, max_tokens, image bytes'
+        digest, etc.) the caller wants folded into the key."""
+        h = hashlib.sha256()
+        h.update(b"m|"); h.update(str(model).encode("utf-8"))
+        h.update(b"|s|")
+        h.update(_stable_dumps(system).encode("utf-8"))
+        h.update(b"|u|")
+        h.update(_stable_dumps(user).encode("utf-8"))
+        if extra:
+            h.update(b"|x|")
+            h.update(_stable_dumps(extra).encode("utf-8"))
+        return h.hexdigest()
+
+    def get(self, key: str) -> Optional[dict]:
+        with self._lock, sqlite3.connect(self.db_path) as con:
+            row = con.execute(
+                "SELECT value, expires_at FROM cache WHERE key=?", (key,)
+            ).fetchone()
+        if not row:
+            return None
+        value_json, expires_at = row
+        if int(time.time()) > int(expires_at):
+            return None  # expired; GC sweeps async
+        try:
+            return json.loads(value_json)
+        except Exception:  # noqa: BLE001
+            return None
+
+    def set(self, key: str, value: dict, ttl_s: int = 86400) -> None:
+        now = int(time.time())
+        payload = json.dumps(value, ensure_ascii=False)
+        with self._lock, sqlite3.connect(self.db_path) as con:
+            con.execute(
+                "INSERT OR REPLACE INTO cache(key, value, expires_at, created_at) "
+                "VALUES (?,?,?,?)",
+                (key, payload, now + int(ttl_s), now),
+            )
+            con.commit()
+
+    def gc(self) -> int:
+        """Delete expired rows. Returns count deleted. Safe to call
+        anytime; workers can hook a nightly cron to this."""
+        with self._lock, sqlite3.connect(self.db_path) as con:
+            cur = con.execute(
+                "DELETE FROM cache WHERE expires_at < ?", (int(time.time()),)
+            )
+            con.commit()
+            return cur.rowcount
+
+
+def _stable_dumps(obj: Any) -> str:
+    """json.dumps with sort_keys + ensure_ascii=False for stable hashing.
+    Non-JSON objects fall back to repr() which is stable enough for
+    cache keys of already-simple call payloads."""
+    try:
+        return json.dumps(obj, sort_keys=True, ensure_ascii=False,
+                          separators=(",", ":"))
+    except (TypeError, ValueError):
+        return repr(obj)
+
+
+def _system_block(system: Union[str, list, None],
+                  cache: bool) -> Optional[list]:
+    """Build the `system` field for Anthropic messages, applying
+    cache_control: ephemeral when `cache` is True.
+
+    Accepts:
+    - str          → single text block
+    - list of dict → passed through, but cache_control added to the
+                     final block if `cache` is True (Anthropic supports
+                     up to 4 cache breakpoints; we default to the last).
+    - None / empty → returns None (caller omits the field)
+    """
+    if not system:
+        return None
+    if isinstance(system, str):
+        block: dict = {"type": "text", "text": system}
+        if cache:
+            block["cache_control"] = {"type": "ephemeral"}
+        return [block]
+    # list case — passthrough with tail cache
+    blocks = list(system)
+    if cache and blocks:
+        tail = dict(blocks[-1])
+        tail.setdefault("cache_control", {"type": "ephemeral"})
+        blocks[-1] = tail
+    return blocks
+
+
+class ClaudeClient:
+    """Stdlib Anthropic /v1/messages client with cache_control by default
+    and optional result-cache short-circuit.
+
+    Public surface:
+        .messages(system, user, ...) -> dict
+        .batch_create(requests)      -> str batch_id
+        .batch_status(batch_id)      -> dict
+        .batch_results(batch_id)     -> Iterator[dict]
+
+    Response shape (from .messages()):
+        {"text": str,
+         "model": str,
+         "tokens_in": int|None,
+         "tokens_out": int|None,
+         "cache_read_input_tokens": int,
+         "cache_creation_input_tokens": int,
+         "stop_reason": str|None,
+         "cached": bool}
+    On failure: {"error": "...", "text": ""}
+    """
+
+    def __init__(self, config: Optional[ClaudeConfig] = None,
+                 cache: Optional[SqliteResultCache] = None,
+                 counters: Optional[CallCounters] = None,
+                 log_prefix: str = "claude"):
+        self.config = config or ClaudeConfig()
+        self._cache = cache
+        self._counters = counters
+        self._log_prefix = log_prefix
+
+    # ----- internal -----
+
+    def _headers(self, extra: Optional[dict] = None) -> dict:
+        h = {
+            "Content-Type": "application/json",
+            "x-api-key": self.config.api_key,
+            "anthropic-version": self.config.api_version,
+            "User-Agent": self.config.user_agent,
+        }
+        if extra:
+            h.update(extra)
+        return h
+
+    def _err(self, where: str, exc: BaseException) -> None:
+        print(f"[{self._log_prefix}.{where}] {type(exc).__name__}: "
+              f"{str(exc)[:300]}", file=sys.stderr)
+
+    # ----- public -----
+
+    def messages(self,
+                 system: Union[str, list, None],
+                 user: Union[str, list],
+                 model: Optional[str] = None,
+                 max_tokens: int = 1024,
+                 temperature: float = 0.1,
+                 cache_system: Optional[bool] = None,
+                 cache_ttl_s: int = 86400,
+                 use_result_cache: bool = True,
+                 extra_headers: Optional[dict] = None,
+                 stop_sequences: Optional[list] = None) -> dict:
+        """Single /v1/messages call.
+
+        `system` — the big static instruction blob. Auto-cached unless
+                    `cache_system=False`. For long prompts (≥1024 tok
+                    on Sonnet) this cuts input-token cost by ~90% on
+                    repeat calls.
+        `user`   — str (converted to a single text block) or a list of
+                    content blocks (for vision + text combined).
+        `use_result_cache` — when True and a SqliteResultCache is wired
+                    in, look up (model, system, user, opts) and skip
+                    the API call on hit.
+        """
+        model = model or self.config.default_model
+        if not self.config.api_key:
+            if self._counters is not None:
+                self._counters.record(False)
+            return {"error": "no api key", "text": ""}
+
+        do_cache = (self.config.cache_system_by_default
+                    if cache_system is None else bool(cache_system))
+
+        # Result-cache lookup — before any network I/O.
+        cache_key: Optional[str] = None
+        if use_result_cache and self._cache is not None:
+            cache_key = SqliteResultCache.make_key(
+                model, system, user,
+                extra={"max_tokens": max_tokens, "temperature": temperature,
+                       "stop_sequences": stop_sequences or []},
+            )
+            hit = self._cache.get(cache_key)
+            if hit is not None:
+                if self._counters is not None:
+                    self._counters.record(True)
+                return {**hit, "cached": True}
+
+        # Build user content list.
+        if isinstance(user, str):
+            content: list = [{"type": "text", "text": user}]
+        else:
+            content = list(user)
+
+        body: dict = {
+            "model": model,
+            "max_tokens": int(max_tokens),
+            "temperature": float(temperature),
+            "messages": [{"role": "user", "content": content}],
+        }
+        sysb = _system_block(system, do_cache)
+        if sysb is not None:
+            body["system"] = sysb
+        if stop_sequences:
+            body["stop_sequences"] = list(stop_sequences)
+
+        req = urllib.request.Request(
+            f"{self.config.base_url}/v1/messages",
+            data=json.dumps(body).encode(),
+            headers=self._headers(extra_headers),
+            method="POST",
+        )
+
+        try:
+            with urllib.request.urlopen(
+                req, timeout=self.config.timeout, context=_ctx
+            ) as r:
+                result = json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            snippet = (e.read() or b"")[:300].decode("utf-8", errors="replace")
+            self._err("messages", e)
+            if self._counters is not None:
+                self._counters.record(False)
+            return {"error": f"claude http {e.code}: {snippet}", "text": ""}
+        except Exception as e:  # noqa: BLE001
+            self._err("messages", e)
+            if self._counters is not None:
+                self._counters.record(False)
+            return {"error": f"claude call failed: {e}", "text": ""}
+
+        # Extract text; join every text block (Claude may emit multiple).
+        text_parts: list = []
+        for block in (result.get("content") or []):
+            if (block or {}).get("type") == "text":
+                text_parts.append(block.get("text", ""))
+        text = "".join(text_parts)
+
+        usage = result.get("usage") or {}
+        out = {
+            "text": text,
+            "model": result.get("model") or model,
+            "tokens_in":  usage.get("input_tokens"),
+            "tokens_out": usage.get("output_tokens"),
+            "cache_read_input_tokens":
+                int(usage.get("cache_read_input_tokens") or 0),
+            "cache_creation_input_tokens":
+                int(usage.get("cache_creation_input_tokens") or 0),
+            "stop_reason": result.get("stop_reason"),
+            "cached": False,
+        }
+
+        if self._counters is not None:
+            self._counters.record(bool(text))
+
+        # Store in result cache — even error-shaped short responses are
+        # skipped by the `text` guard so we never memoize failures.
+        if cache_key is not None and text:
+            try:
+                self._cache.set(cache_key, out, ttl_s=cache_ttl_s)
+            except Exception:  # noqa: BLE001
+                pass  # cache write failures never block the hot path
+
+        return out
+
+    # ----- batch API — 50% off async workloads -----
+
+    def batch_create(self, requests: list[dict]) -> dict:
+        """Submit a batch. Each request must be:
+            {"custom_id": "<caller-supplied id>",
+             "params":    {system, user, model?, max_tokens?, ...}}
+
+        `params` uses the same shape as .messages() and gets the same
+        cache_control treatment.
+
+        Returns the raw API response (contains `id`, `processing_status`,
+        etc.) or {"error": ...}.
+        """
+        if not self.config.api_key:
+            return {"error": "no api key"}
+        if not requests:
+            return {"error": "empty batch"}
+
+        api_requests: list = []
+        for r in requests:
+            params = dict(r.get("params") or {})
+            system = params.pop("system", None)
+            user = params.pop("user", "")
+            model = params.pop("model", self.config.default_model)
+            max_tokens = int(params.pop("max_tokens", 1024))
+            temperature = float(params.pop("temperature", 0.1))
+            cache_system = params.pop("cache_system",
+                                      self.config.cache_system_by_default)
+
+            content = ([{"type": "text", "text": user}]
+                       if isinstance(user, str) else list(user))
+            api_body: dict = {
+                "model": model,
+                "max_tokens": max_tokens,
+                "temperature": temperature,
+                "messages": [{"role": "user", "content": content}],
+            }
+            sysb = _system_block(system, bool(cache_system))
+            if sysb is not None:
+                api_body["system"] = sysb
+            for k, v in params.items():
+                api_body[k] = v
+
+            api_requests.append({
+                "custom_id": str(r.get("custom_id") or ""),
+                "params": api_body,
+            })
+
+        body = json.dumps({"requests": api_requests}).encode()
+        req = urllib.request.Request(
+            f"{self.config.base_url}/v1/messages/batches",
+            data=body,
+            headers=self._headers({
+                "anthropic-beta": "message-batches-2024-09-24",
+            }),
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(
+                req, timeout=self.config.timeout, context=_ctx
+            ) as r:
+                return json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            snippet = (e.read() or b"")[:300].decode("utf-8", errors="replace")
+            self._err("batch_create", e)
+            return {"error": f"batch_create http {e.code}: {snippet}"}
+        except Exception as e:  # noqa: BLE001
+            self._err("batch_create", e)
+            return {"error": f"batch_create failed: {e}"}
+
+    def batch_status(self, batch_id: str) -> dict:
+        req = urllib.request.Request(
+            f"{self.config.base_url}/v1/messages/batches/"
+            f"{urllib.parse.quote(batch_id, safe='')}",
+            headers=self._headers({
+                "anthropic-beta": "message-batches-2024-09-24",
+            }),
+        )
+        try:
+            with urllib.request.urlopen(
+                req, timeout=self.config.timeout, context=_ctx
+            ) as r:
+                return json.loads(r.read())
+        except Exception as e:  # noqa: BLE001
+            self._err("batch_status", e)
+            return {"error": f"batch_status failed: {e}"}
+
+    def batch_results(self, batch_id: str) -> Iterator[dict]:
+        """Stream JSONL results for a completed batch. Each line is
+        `{"custom_id": ..., "result": {...}}`. Caller decodes."""
+        status = self.batch_status(batch_id)
+        results_url = (status or {}).get("results_url")
+        if not results_url:
+            yield {"error": "no results_url",
+                   "status": (status or {}).get("processing_status")}
+            return
+        req = urllib.request.Request(
+            results_url,
+            headers=self._headers({
+                "anthropic-beta": "message-batches-2024-09-24",
+            }),
+        )
+        try:
+            with urllib.request.urlopen(
+                req, timeout=self.config.timeout, context=_ctx
+            ) as r:
+                buf = b""
+                while True:
+                    chunk = r.read(65536)
+                    if not chunk:
+                        break
+                    buf += chunk
+                    while b"\n" in buf:
+                        line, buf = buf.split(b"\n", 1)
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            yield json.loads(line.decode("utf-8"))
+                        except json.JSONDecodeError:
+                            continue
+        except Exception as e:  # noqa: BLE001
+            self._err("batch_results", e)
+            yield {"error": f"batch_results failed: {e}"}
+
+
+
+
+
 __all__ = [
     "REFUSAL_RE",
     "DEFAULT_QUALITY_THRESHOLD",
@@ -587,4 +1080,9 @@ __all__ = [
     "BarbaraConfig",
     "BarbaraClient",
     "FallbackChain",
+    # Claude client + result cache + batch API
+    "DEFAULT_CLAUDE_MODEL",
+    "ClaudeConfig",
+    "ClaudeClient",
+    "SqliteResultCache",
 ]
