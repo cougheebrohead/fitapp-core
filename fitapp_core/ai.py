@@ -335,35 +335,47 @@ class BarbaraClient:
 
     def vision(self, image_bytes: bytes, media_type: str,
                system_prompt: str, user_prompt: str,
-               raw: bool = False) -> Any:
-        """Call Barbara's vision model with an image payload."""
+               raw: bool = False,
+               model: Optional[str] = None,
+               timeout: Optional[int] = None,
+               image_max_dim: int = 768,
+               num_predict: int = 600) -> Any:
+        """Call Barbara's vision model with an image payload.
+
+        Optional per-call overrides let engine.py implement a hybrid cascade
+        (fast 7B first, slow 32B safety net) without spinning up a second
+        client. Defaults fall back to the client's configured vision model +
+        timeout. image_max_dim=768 (was 1024) roughly halves vision-token
+        count for a real inference speedup on M-series hardware while still
+        holding food-ID quality. num_predict=600 caps generation for typical
+        food-photo responses."""
         base = self.config.url_clean()
         if not base:
             return _unavailable(raw)
+        chosen_model = model or self.config.vision_model
+        chosen_timeout = timeout if timeout is not None else self.config.vision_timeout
         try:
             if self._resize is not None:
                 try:
-                    image_bytes = self._resize(image_bytes, media_type, max_dim=1024)
+                    image_bytes = self._resize(image_bytes, media_type, max_dim=image_max_dim)
                 except Exception:  # noqa: BLE001 — best-effort downsize
                     pass
             b64 = base64.standard_b64encode(image_bytes).decode()
             body = json.dumps({
-                "model": self.config.vision_model,
+                "model": chosen_model,
                 "messages": [
                     {"role": "system", "content": system_prompt},
                     {"role": "user",   "content": user_prompt, "images": [b64]},
                 ],
                 "stream":  False,
                 "format":  "json",
-                # 900 caps the worst-case generation time. Typical food photo
-                # responses are 500-800 tokens; 900 leaves headroom for complex
-                # 10-item plates.
-                "options": {"temperature": 0.1, "num_predict": 900},
+                "options": {"temperature": 0.1, "num_predict": int(num_predict),
+                            "num_ctx": 4096},
             }).encode()
             req = urllib.request.Request(f"{base}/api/chat", data=body,
                                          headers=self._headers())
             with urllib.request.urlopen(
-                req, timeout=self.config.vision_timeout, context=_ctx
+                req, timeout=chosen_timeout, context=_ctx
             ) as r:
                 result = json.loads(r.read())
             text = result.get("message", {}).get("content", "")
